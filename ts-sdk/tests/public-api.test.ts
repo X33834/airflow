@@ -24,17 +24,23 @@ import type {
   ConnectionResult,
   DagSpec,
   GetXComOpts,
+  JsonValue,
+  Node,
   SetXComOpts,
   TaskClient,
   Registerable,
   TaskContext,
   TaskFactory,
   TaskFunction,
+  TaskGroupOptions,
+  TaskGroupRef,
   TaskInput,
   TaskInputs,
   TaskOptions,
   TaskRef,
   TaskSpec,
+  TaskStateStore,
+  TaskStateStoreSetOpts,
 } from "../src/index.js";
 import * as sdk from "../src/index.js";
 import {
@@ -43,6 +49,7 @@ import {
   Dag,
   getClient,
   getContext,
+  NEVER_EXPIRE,
   SUPERVISOR_API_VERSION,
   TaskHandler,
   VariableNotFoundError,
@@ -59,8 +66,11 @@ describe("public API", () => {
     );
     const upstream = upstreamTask();
     const downstream = downstreamTask({ upstream });
-    expect(upstream).toEqual({ dagId: "public_api_dag", taskId: "public_api_task" });
-    expect(downstream).toEqual({ dagId: "public_api_dag", taskId: "public_api_downstream" });
+    expect(upstream).toMatchObject({ dagId: "public_api_dag", taskId: "public_api_task" });
+    expect(downstream).toMatchObject({
+      dagId: "public_api_dag",
+      taskId: "public_api_downstream",
+    });
     expect(dag.taskIds).toEqual(["public_api_task", "public_api_downstream"]);
     // serve() hands the bundle to the runtime, which needs the supervisor's
     // socket addresses that Airflow puts on argv.
@@ -142,6 +152,12 @@ describe("public API", () => {
       expect(name in bundle).toBe(false);
     }
     expectTypeOf<keyof Bundle>().toEqualTypeOf<"register" | "serve" | "getTaskHandler">();
+  });
+
+  it("leaves the human-in-the-loop factories to the hitl subpath", () => {
+    for (const name of ["approval", "hitl", "humanInput"]) {
+      expect(name in sdk).toBe(false);
+    }
   });
 
   it("does not export the removed registerTask surface or the coordinator itself", () => {
@@ -280,9 +296,15 @@ describe("public API", () => {
     expectTypeOf<typeof sdk>().not.toHaveProperty("serveDags");
     expectTypeOf<typeof sdk>().not.toHaveProperty("DagRegistry");
     expectTypeOf(SUPERVISOR_API_VERSION).toMatchTypeOf<string>();
+    expectTypeOf(NEVER_EXPIRE).toMatchTypeOf<symbol>();
   });
 
   it("keeps the Dag authoring signatures extensible via trailing specs", () => {
+    // Identity, plus the two order-only edge verbs; the handler and the value
+    // stay hidden.
+    expectTypeOf<Extract<keyof TaskRef, string>>().toEqualTypeOf<
+      "dagId" | "taskId" | "before" | "after"
+    >();
     expectTypeOf<TaskRef["dagId"]>().toEqualTypeOf<string>();
     expectTypeOf<TaskRef["taskId"]>().toEqualTypeOf<string>();
     // A reference carries its handler's return type, so a construct that needs
@@ -290,6 +312,34 @@ describe("public API", () => {
     // a wider one is, and not the other way round.
     expectTypeOf<TaskRef<boolean>>().toMatchTypeOf<TaskRef>();
     expectTypeOf<TaskRef>().not.toMatchTypeOf<TaskRef<boolean>>();
+    // Variadic, and each returns its own receiver rather than its arguments,
+    // return type included.
+    expectTypeOf<TaskRef<boolean>["before"]>().toEqualTypeOf<
+      (...downstream: readonly Node[]) => TaskRef<boolean>
+    >();
+    expectTypeOf<TaskRef<boolean>["after"]>().toEqualTypeOf<
+      (...upstream: readonly Node[]) => TaskRef<boolean>
+    >();
+    // A group is a scope and an edge endpoint, and nests the same way at
+    // every depth.
+    expectTypeOf<Extract<keyof TaskGroupRef, string>>().toEqualTypeOf<
+      "dagId" | "groupId" | "task" | "taskGroup" | "before" | "after"
+    >();
+    expectTypeOf<TaskGroupRef["groupId"]>().toEqualTypeOf<string>();
+    expectTypeOf<TaskGroupRef["taskGroup"]>().toEqualTypeOf<
+      (groupId: string, options?: TaskGroupOptions) => TaskGroupRef
+    >();
+    expectTypeOf<Dag["taskGroup"]>().toEqualTypeOf<
+      (groupId: string, options?: TaskGroupOptions) => TaskGroupRef
+    >();
+    // Python's prefix_group_id, and the only option a group takes so far.
+    expectTypeOf<TaskGroupOptions>().toEqualTypeOf<{ readonly prefixGroupId?: boolean }>();
+    expectTypeOf<TaskGroupRef["before"]>().toEqualTypeOf<
+      (...downstream: readonly Node[]) => TaskGroupRef
+    >();
+    // Both satisfy Node, which is what lets an edge join either kind.
+    expectTypeOf<TaskRef>().toExtend<Node>();
+    expectTypeOf<TaskGroupRef>().toExtend<Node>();
     // Wiring moved to the factory call, and the spec is the trailing argument
     // itself.
     expectTypeOf<TaskOptions>().toEqualTypeOf<TaskSpec>();
@@ -321,6 +371,10 @@ describe("public API", () => {
     expectTypeOf<Dag["taskIds"]>().toEqualTypeOf<readonly string[]>();
     // Both specs are all-optional, so `{}` stays assignable and a field the
     // schema gains later cannot break a call site.
+    // `queue` is the one Dag field Airflow's schema does not have: a native
+    // Dag's tasks all run on the same coordinator, so the queue that routes
+    // them there belongs on the Dag.
+    expectTypeOf<DagSpec["queue"]>().toEqualTypeOf<string | undefined>();
     const emptyDagSpec: DagSpec = {};
     const emptyTaskSpec: TaskSpec = {};
     expect([emptyDagSpec, emptyTaskSpec]).toEqual([{}, {}]);
@@ -386,11 +440,24 @@ describe("public API", () => {
       (key: string, value: string, description?: string | null) => Promise<void>
     >();
     expectTypeOf<TaskClient["deleteVariable"]>().toEqualTypeOf<(key: string) => Promise<void>>();
+    expectTypeOf<TaskStateStoreSetOpts>().toEqualTypeOf<{
+      retentionMs?: number | typeof NEVER_EXPIRE;
+    }>();
+    expectTypeOf<TaskClient["taskStateStore"]>().toEqualTypeOf<TaskStateStore>();
+    expectTypeOf<TaskStateStore["get"]>().toEqualTypeOf<
+      <T = unknown>(key: string) => Promise<T | null>
+    >();
+    expectTypeOf<TaskStateStore["set"]>().toEqualTypeOf<
+      (key: string, value: NonNullable<JsonValue>, opts?: TaskStateStoreSetOpts) => Promise<void>
+    >();
+    expectTypeOf<TaskStateStore["delete"]>().toEqualTypeOf<(key: string) => Promise<void>>();
+    expectTypeOf<TaskStateStore["clear"]>().toEqualTypeOf<() => Promise<void>>();
   });
 
   it("rejects wire-format names and non-JSON XCom values", () => {
     function acceptsGetXComOpts(_opts: GetXComOpts): void {}
     function acceptsSetXComOpts(_opts: SetXComOpts): void {}
+    function acceptsTaskStateValue(_value: NonNullable<JsonValue>): void {}
 
     acceptsGetXComOpts({
       key: "result",
@@ -480,5 +547,9 @@ describe("public API", () => {
     expectTypeOf<TaskRef>().toHaveProperty("handler");
     // @ts-expect-error XCom values must be JSON-compatible.
     acceptsSetXComOpts({ key: "result", value: new Date() });
+    // @ts-expect-error task-state-store values must be JSON-compatible.
+    acceptsTaskStateValue(new Date());
+    // @ts-expect-error task-state-store values must not be null.
+    acceptsTaskStateValue(null);
   });
 });
